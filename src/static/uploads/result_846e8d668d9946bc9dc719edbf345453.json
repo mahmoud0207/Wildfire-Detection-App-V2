@@ -1,0 +1,7 @@
+{
+    "prediction": "no_wildfire",
+    "confidence": 0.1098,
+    "coordinates": null,
+    "image_file": "img_15ca486e91b140139b3336d2c23fccae.png",
+    "model_file": "model_bfa980662e334836a79f01d314c55aa7.keras"
+}

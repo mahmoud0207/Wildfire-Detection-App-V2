@@ -1,0 +1,10 @@
+exifread
+torch
+torchvision
+nbformat
+nbconvert
+func_timeout
+Flask
+Pillow
+numpy
+tensorflow
