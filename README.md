@@ -77,7 +77,8 @@ flask run --host=0.0.0.0 --port=5000
 
 
 
-Note: Ensure your requirements.txt contains:
+Note: 
+Ensure your requirements.txt contains:
 flask==3.0.2
 tensorflow==2.15.0
 numpy==1.24.4
