@@ -1,364 +1,349 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import os
 import uuid
-import json
-import exifread
-import torch
-import torch.nn as nn
-import nbformat
-from nbconvert import PythonExporter
-from func_timeout import func_timeout, FunctionTimedOut
-from flask import Flask, render_template, request, jsonify, send_file, Response
-from werkzeug.utils import secure_filename
-from PIL import Image, ImageDraw
-from torchvision import transforms
-import tempfile
-import shutil
+import io
+import logging
 import numpy as np
+from flask import Flask, render_template, request, jsonify, send_from_directory, send_file
+from werkzeug.utils import secure_filename
+from PIL import Image
+import datetime
+
+# Configure matplotlib before other imports
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
+
+# TensorFlow/Keras imports
 import tensorflow as tf
-from typing import (
-    TYPE_CHECKING, Any, Tuple, cast, Union,
-    Sequence, Dict, Optional
-)
-import numpy.typing as npt
-
-
-if TYPE_CHECKING:
-    from tensorflow.keras.models import Model
-    from tensorflow.python.types.core import TensorLike
-    from PIL.Image import Image as PILImage
-else:
-    Model = Any
-    TensorLike = Any
-    PILImage = Any
-
-
-ResponseReturnValue = Union[
-    Response,
-    Tuple[Response, int],
-    str,
-    Tuple[str, int],
-    Dict[str, Any],
-    Tuple[Dict[str, Any], int]
-]
-
-
-tf.get_logger().setLevel('ERROR')
-tf.keras.utils.disable_interactive_logging()
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-
-# Keras imports
 from tensorflow.keras.models import load_model
-from tensorflow.keras.applications.inception_v3 import preprocess_input
-
-class WildfireBaseModel(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2)
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(64 * 56 * 56, 128),
-            nn.ReLU(),
-            nn.Linear(128, 2)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = x.view(x.size(0), -1)
-        x = self.classifier(x)
-        return x
+from tensorflow.keras.preprocessing import image
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 
+# Configuration
 app.config.update({
     'UPLOAD_FOLDER': 'static/uploads',
     'MODEL_FOLDER': 'static/models',
-    'ALLOWED_EXTENSIONS': {
-        'png', 'jpg', 'jpeg', 'tif', 'tiff',
-        'pth', 'pt', 'ipynb', 'keras', 'h5'
-    },
-    'MAX_CONTENT_LENGTH': 1024 * 1024 * 1024,
-    'NOTEBOOK_TIMEOUT': 30
+    'ALLOWED_EXTENSIONS': {'jpg', 'jpeg', 'tif', 'tiff', 'h5', 'keras'},
+    'MAX_CONTENT_LENGTH': 1024 * 1024 * 1024,  # 1GB
 })
 
+# Ensure directories exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['MODEL_FOLDER'], exist_ok=True)
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 def allowed_file(filename: str) -> bool:
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
-def convert_tiff_to_png(tiff_path: str) -> str:
-    png_path = tiff_path.rsplit('.', 1)[0] + '.png'
-    with Image.open(tiff_path) as img:
-        img.save(png_path, 'PNG')
-    return png_path
-
-def get_gps_coordinates(image_path: str) -> Tuple[float, float]:
-    with open(image_path, 'rb') as f:
-        tags = exifread.process_file(f, details=False)
-        gps_lat = tags.get('GPS GPSLatitude')
-        gps_lon = tags.get('GPS GPSLongitude')
-        lat_ref = tags.get('GPS GPSLatitudeRef')
-        lon_ref = tags.get('GPS GPSLongitudeRef')
-        
-        if all([gps_lat, gps_lon, lat_ref, lon_ref]):
-            try:
-                lat = cast(list, gps_lat.values)
-                lon = cast(list, gps_lon.values)
-                
-                lat_decimal = float(lat[0]) + float(lat[1]/60) + float(lat[2]/3600)
-                lon_decimal = float(lon[0]) + float(lon[1]/60) + float(lon[2]/3600)
-                
-                if str(lat_ref) != 'N':
-                    lat_decimal *= -1
-                if str(lon_ref) != 'E':
-                    lon_decimal *= -1
-                
-                return (round(lat_decimal, 6), round(lon_decimal, 6))
-            except Exception:
-                pass
-    return (0.0, 0.0)
-
-def create_heatmap(
-    original_img: Image.Image,
-    prediction: int,
-    confidence: float,
-    output_path: str
-) -> None:
-    base_img = original_img.convert('RGBA')
-    overlay = Image.new('RGBA', base_img.size, (255, 255, 255, 0))
-    if prediction == 1:
-        alpha = int(confidence * 255)
-        overlay = Image.new('RGBA', base_img.size, (255, 0, 0, alpha))
-    result = Image.alpha_composite(base_img, overlay).convert('RGB')
-    draw = ImageDraw.Draw(result)
-    text = f"{'Wildfire Detected' if prediction == 1 else 'No Wildfire'} ({confidence*100:.1f}%)"
-    draw.text((10, 10), text, fill=(255, 0, 0), stroke_width=2, stroke_fill=(255, 255, 255))
-    result.save(output_path)
-
-def convert_ipynb_to_model(ipynb_path: str) -> str:
-    temp_dir = tempfile.mkdtemp()
-    temp_model_path = os.path.join(temp_dir, "model.pth")
+def preprocess_image(img_path: str, target_size: tuple[int, int] = (224, 224)) -> np.ndarray:
+    """Load and preprocess image for model prediction."""
     try:
-        with open(ipynb_path, 'r', encoding='utf-8') as f:
-            notebook = nbformat.read(f, as_version=4)
-        exporter = PythonExporter()
-        script, _ = exporter.from_notebook_node(notebook)
-        global_namespace = {
-            '__builtins__': __builtins__,
-            'torch': torch,
-            'nn': nn,
-            'WildfireBaseModel': WildfireBaseModel,
-            'temp_model_path': temp_model_path
-        }
-        exec(script, global_namespace)
-        if not os.path.exists(temp_model_path):
-            raise RuntimeError("No valid model file created by notebook")
-        final_path = os.path.join(app.config['MODEL_FOLDER'], f"model_{uuid.uuid4().hex}.pth")
-        shutil.move(temp_model_path, final_path)
-        return final_path
+        if img_path.lower().endswith(('.tif', '.tiff')):
+            import tifffile
+            img = tifffile.imread(img_path)
+            if img.ndim == 2:
+                img = np.stack((img,) * 3, axis=-1)
+            img = tf.image.resize(img, target_size)
+            img = (img / 32767.5) - 1.0  # Normalize 16-bit TIFF
+        else:
+            img = image.load_img(img_path, target_size=target_size)
+            img = image.img_to_array(img)
+            img = (img / 127.5) - 1.0  # Normalize 8-bit images
+            
+        return np.expand_dims(img, axis=0)
     except Exception as e:
-        raise RuntimeError(f"Notebook processing failed: {str(e)}") from e
-    finally:
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+        logger.error(f"Image preprocessing failed: {str(e)}")
+        raise
 
-def prepare_image(
-    img: Image.Image,
-    model_input_shape: Tuple[int, ...]
-) -> npt.NDArray[np.float32]:
-    
-    if len(model_input_shape) == 4:
-        _, height, width, channels = model_input_shape
-    else:
-        height, width, channels = model_input_shape
+def generate_heatmap(model: tf.keras.Model, img_array: np.ndarray, confidence: float) -> str:
+    """Generate activation heatmap visualization with result text."""
+    try:
+        # Find last convolutional layer
+        layer_name = next((layer.name for layer in reversed(model.layers) 
+                         if isinstance(layer, tf.keras.layers.Conv2D)), None)
+        
+        if not layer_name:
+            raise ValueError("No convolutional layers found in model")
 
-    
-    if channels == 1:
-        img_resized = img.resize((width, height)).convert('L')
-    else:
-        img_resized = img.resize((width, height)).convert('RGB')
-
-    img_array = np.array(img_resized).astype('float32')
-    
-    
-    if channels == 3:
-        img_array = preprocess_input(img_array)      
-    else:
-        img_array = (img_array / 127.5) - 1.0  
-
-    return np.expand_dims(img_array, axis=0)
+        # Create activation model
+        activation_model = tf.keras.Model(
+            inputs=model.input,
+            outputs=model.get_layer(layer_name).output
+        )
+        
+        # Generate activations
+        activations = activation_model.predict(img_array)
+        
+        # Create visualization
+        plt.figure(figsize=(12, 6))
+        
+        # Original image - left subplot
+        plt.subplot(1, 2, 1)
+        display_img = ((img_array[0] + 1.0) * 127.5).astype('uint8')
+        plt.imshow(display_img)
+        prediction_label = 'Wildfire' if confidence >= 0.5 else 'No Wildfire'
+        plt.title(f"{prediction_label} ({confidence*100:.1f}%)", fontsize=14)
+        plt.axis('off')
+        
+        # Activation map - right subplot
+        plt.subplot(1, 2, 2)
+        
+        # Create a custom colormap similar to the one in your example
+        colors = [(0.0, (32/255, 135/255, 130/255)),  # teal
+                (0.25, (105/255, 190/255, 40/255)),  # green
+                (0.5, (255/255, 255/255, 0/255)),    # yellow
+                (0.75, (40/255, 85/255, 180/255)),   # blue
+                (1.0, (75/255, 0/255, 130/255))]     # purple
+        custom_cmap = LinearSegmentedColormap.from_list('custom_cmap', colors)
+        
+        # Plot the first activation channel with a 3x3 grid
+        act_data = activations[0, :, :, 0]
+        plt.imshow(act_data, cmap=custom_cmap)
+        plt.title(f"Activations: {layer_name}", fontsize=14)
+        plt.axis('off')
+        
+        # Add overall result text at the top of the figure
+        plt.suptitle(f"WILDFIRE DETECTION RESULT: {prediction_label.upper()} - Confidence: {confidence*100:.1f}%", 
+                     fontsize=16, fontweight='bold', color='red' if confidence >= 0.5 else 'green')
+        
+        # Make the layout tight but leave space for the title
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        
+        # Save to buffer
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+        plt.close()
+        buf.seek(0)
+        
+        # Save to file
+        filename = f"heatmap_{uuid.uuid4().hex}.png"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        with open(filepath, 'wb') as f:
+            f.write(buf.read())
+            
+        return filename
+    except Exception as e:
+        logger.error(f"Heatmap generation failed: {str(e)}")
+        raise
 
 @app.route('/')
-def index() -> str:
+def index():
     return render_template('index.html')
 
+
 @app.route('/upload-image', methods=['POST'])
-def upload_image() -> ResponseReturnValue:
+def upload_image():
     try:
         if 'file' not in request.files:
             return jsonify({'error': 'No file part'}), 400
+            
         file = request.files['file']
         if not file or file.filename == '':
             return jsonify({'error': 'No selected file'}), 400
-
-        filename = secure_filename(file.filename or '')
-        if not allowed_file(filename):
+            
+        if not allowed_file(file.filename):
             return jsonify({'error': 'Invalid file type'}), 400
 
-        ext = filename.split('.')[-1].lower()
-        new_filename = f"img_{uuid.uuid4().hex}.{ext}"
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], new_filename)
+        filename = secure_filename(file.filename)
+        save_name = f"{uuid.uuid4().hex}_{filename}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], save_name)
         file.save(filepath)
         
-        if ext in {'tif', 'tiff'}:
-            png_path = convert_tiff_to_png(filepath)
-            return jsonify({
-                'message': 'TIFF uploaded and converted',
-                'filepath': os.path.basename(png_path)
-            })
+        # Generate a preview image for immediate display
+        preview_filename = f"preview_{save_name}"
+        preview_path = os.path.join(app.config['UPLOAD_FOLDER'], preview_filename)
+        
+        try:
+            # Generate a preview image that's easily viewable in the browser
+            if filename.lower().endswith(('.tif', '.tiff')):
+                # Handle TIFF separately
+                import tifffile
+                img = tifffile.imread(filepath)
+                if img.ndim == 2:  # Grayscale
+                    img = np.stack((img,) * 3, axis=-1)
+                
+                # Normalize and convert to 8-bit
+                min_val = np.min(img)
+                max_val = np.max(img)
+                if max_val > 0:
+                    img = ((img - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+                
+                # Save as JPEG for preview
+                Image.fromarray(img).save(preview_path, format='JPEG', quality=90)
+            else:
+                # For standard images, just resize and save
+                with Image.open(filepath) as img:
+                    img = img.copy()  # Create a copy to avoid potential issues
+                    img.thumbnail((800, 800))  # Resize while maintaining aspect ratio
+                    img.save(preview_path, format='JPEG', quality=90)
+        except Exception as e:
+            logger.warning(f"Preview generation failed: {str(e)}")
+            # If preview fails, we'll continue without it
+            preview_filename = None
+        
         return jsonify({
-            'message': 'Image uploaded successfully',
-            'filepath': new_filename
+            'message': 'File uploaded',
+            'filepath': save_name,
+            'preview_path': preview_filename
         })
     except Exception as e:
+        logger.error(f"Image upload error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/upload-model', methods=['POST'])
-def upload_model() -> ResponseReturnValue:
+def upload_model():
     try:
         if 'file' not in request.files:
             return jsonify({'error': 'No file part'}), 400
+            
         file = request.files['file']
         if not file or file.filename == '':
             return jsonify({'error': 'No selected file'}), 400
+            
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'Invalid file type'}), 400
 
-        filename = secure_filename(file.filename or '')
-        if not allowed_file(filename):
-            return jsonify({'error': 'Invalid file format'}), 400
-
-        ext = filename.split('.')[-1]
-        new_filename = f"model_{uuid.uuid4().hex}.{ext}"
-        filepath = os.path.join(app.config['MODEL_FOLDER'], new_filename)
+        filename = secure_filename(file.filename)
+        save_name = f"{uuid.uuid4().hex}_{filename}"
+        filepath = os.path.join(app.config['MODEL_FOLDER'], save_name)
         file.save(filepath)
+        
         return jsonify({
-            'message': 'File uploaded successfully',
-            'model_path': new_filename
+            'message': 'Model uploaded',
+            'model_path': save_name
         })
     except Exception as e:
+        logger.error(f"Model upload error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/upload-model-url', methods=['POST'])
+def upload_model_url():
+    try:
+        data = request.get_json()
+        if not data or 'url' not in data:
+            return jsonify({'error': 'Missing URL parameter'}), 400
+            
+        url = data['url']
+        if not url:
+            return jsonify({'error': 'Invalid URL'}), 400
+        
+        # Here you would implement URL download logic
+        # For security and scope reasons, this is just a placeholder
+        # In a real implementation, you'd download from the URL
+        
+        return jsonify({
+            'error': 'Model URL download not implemented',
+            'message': 'Feature coming soon'
+        }), 501
+    except Exception as e:
+        logger.error(f"Model URL error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/run-model', methods=['POST'])
-def run_model() -> ResponseReturnValue:
+def run_model():
     try:
         data = request.get_json()
         if not data or 'image_path' not in data or 'model_path' not in data:
             return jsonify({'error': 'Missing parameters'}), 400
 
-        img_path = os.path.join(app.config['UPLOAD_FOLDER'], str(data['image_path']))
-        model_path = os.path.join(app.config['MODEL_FOLDER'], str(data['model_path']))
-
-        if model_path.endswith('.ipynb'):
-            try:
-                model_path = func_timeout(
-                    app.config['NOTEBOOK_TIMEOUT'],
-                    convert_ipynb_to_model,
-                    args=(model_path,)
-                )
-            except FunctionTimedOut:
-                return jsonify({'error': 'Notebook execution timed out'}), 400
-
+        # Validate paths
+        img_path = os.path.join(app.config['UPLOAD_FOLDER'], data['image_path'])
+        model_path = os.path.join(app.config['MODEL_FOLDER'], data['model_path'])
+        
         if not os.path.exists(img_path) or not os.path.exists(model_path):
             return jsonify({'error': 'Invalid file paths'}), 400
 
-        img = Image.open(img_path).convert('RGB')
-        result_base = f"result_{uuid.uuid4().hex}"
-        json_filename = f"{result_base}.json"
-        png_filename = f"{result_base}.png"
-        json_path = os.path.join(app.config['UPLOAD_FOLDER'], json_filename)
-        png_path = os.path.join(app.config['UPLOAD_FOLDER'], png_filename)
+        # Load model
+        model = load_model(model_path, compile=False)
+        
+        # Process image
+        img_array = preprocess_image(img_path)
+        
+        # Make prediction
+        pred = model.predict(img_array)
+        confidence = float(pred[0][0]) if model.output_shape[-1] == 1 else float(np.max(pred))
+        prediction = 1 if confidence >= 0.5 else 0
 
-        if model_path.endswith(('.keras', '.h5')):
-            try:
-                model = load_model(model_path, compile=False)
-                input_shape = cast(Tuple[int, ...], model.input_shape)
-                img_array = prepare_image(img, input_shape)
-                
-                prediction = model.predict(img_array)
-                
-                # Handle different output types
-                if prediction.shape[-1] == 1:  # Sigmoid output
-                    confidence = float(prediction[0][0])
-                    pred_class = 1 if confidence >= 0.5 else 0
-                else:  # Softmax output
-                    confidence = float(np.max(prediction))
-                    pred_class = int(np.argmax(prediction))
-            except Exception as e:
-                return jsonify({'error': f'Keras model error: {str(e)}'}), 500
-        elif model_path.endswith(('.pth', '.pt')):
-            try:
-                model = WildfireBaseModel()
-                model.load_state_dict(torch.load(model_path, map_location='cpu'))
-                model.eval()
-                
-                preprocess = transforms.Compose([
-                    transforms.Resize(256),
-                    transforms.CenterCrop(224),
-                    transforms.ToTensor(),
-                    transforms.Normalize(
-                        mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]
-                    )
-                ])
-                
-                img_tensor = preprocess(img).unsqueeze(0)
-                with torch.no_grad():
-                    output = model(img_tensor)
-                    probabilities = torch.nn.functional.softmax(output[0], dim=0)
-                    confidence_tensor, pred_class_tensor = torch.max(probabilities, 0)
-                    confidence = confidence_tensor.item()
-                    pred_class = pred_class_tensor.item()
-            except Exception as e:
-                return jsonify({'error': f'PyTorch model error: {str(e)}'}), 500
-        else:
-            return jsonify({'error': 'Unsupported model format'}), 400
+        # Generate result image
+        result_filename = f"result_{uuid.uuid4().hex}.png"
+        result_filepath = os.path.join(app.config['UPLOAD_FOLDER'], result_filename)
+        
+        # Create visualization image
+        try:
+            if img_path.lower().endswith(('.tif', '.tiff')):
+                import tifffile
+                display_img = tifffile.imread(img_path)
+                if display_img.ndim == 2:
+                    display_img = np.stack((display_img,) * 3, axis=-1)
+                min_val = np.min(display_img)
+                max_val = np.max(display_img)
+                if max_val > min_val:
+                    display_img = ((display_img - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+            else:
+                display_img = np.array(Image.open(img_path))
+            
+            # Create annotated image
+            plt.figure(figsize=(10, 6))
+            plt.imshow(display_img)
+            plt.title(f"Prediction: {'Wildfire' if prediction else 'No Wildfire'}\nConfidence: {confidence*100:.1f}%", 
+                     fontsize=12, pad=20)
+            plt.axis('off')
+            
+            # Save visualization
+            plt.savefig(result_filepath, bbox_inches='tight', dpi=150)
+            plt.close()
+            
+        except Exception as e:
+            logger.error(f"Result image generation failed: {str(e)}")
+            result_filename = None
 
-        json.dump({
-            "prediction": "wildfire_detected" if pred_class == 1 else "no_wildfire",
-            "confidence": round(confidence, 4),
-            "coordinates": get_gps_coordinates(img_path)
-        }, open(json_path, 'w'))
-
-        create_heatmap(img, pred_class, confidence, png_path)
+        # Prepare text result data
+        text_result = {
+            'prediction': 'Wildfire detected' if prediction else 'No wildfire detected',
+            'confidence': f"{confidence*100:.1f}%",
+            'model_used': os.path.basename(model_path),
+            'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # Properly referenced
+            'image_dimensions': dict(zip(['width', 'height'], display_img.shape[:2][::-1]))
+        }
 
         return jsonify({
-            'message': 'Processing complete',
-            'result_path': png_filename,
-            'json_path': json_filename
+            'prediction': 'wildfire' if prediction else 'no_wildfire',
+            'confidence': round(confidence, 4),
+            'result_url': f"/results/{result_filename}" if result_filename else None,
+            'text_result': text_result
         })
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Model execution error: {str(e)}")
+        return jsonify({
+            'error': str(e),
+            'prediction': 'error',
+            'confidence': 0
+        }), 500
+
+@app.route('/get-text-result')
+def get_text_result():
+    return jsonify(analysisResult['text_result']), 200   
+
+@app.route('/results/<filename>')
+def get_result(filename):
+    try:
+        return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+    except FileNotFoundError:
+        return jsonify({'error': 'File not found'}), 404
 
 @app.route('/download-result/<filename>')
-def download_result(filename: str) -> ResponseReturnValue:
+def download_result(filename):
     try:
-        safe_filename = secure_filename(filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], safe_filename)
-        return send_file(filepath, as_attachment=True)
+        return send_file(os.path.join(app.config['UPLOAD_FOLDER'], filename), as_attachment=True)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    try:
-        app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
-    except Exception as e:
-        print(f"Server failed to start: {str(e)}")
-        raise
-    
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)

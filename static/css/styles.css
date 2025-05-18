@@ -1,34 +1,176 @@
-.container { 
-    max-width: 800px; 
-    margin-top: 50px; 
+:root {
+    --primary-color: #3498db;
+    --secondary-color: #2ecc71;
+    --text-color: #f8f9fa;
+    --dark-bg: #212529;
+    --white: #343a40;
 }
 
-.preview-box {
-    border: 2px dashed #dee2e6;
-    padding: 1.5rem;
-    margin: 1.5rem 0;
-    min-height: 200px;
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    line-height: 1.6;
+    color: var(--text-color);
+    background: linear-gradient(rgba(0,0,0,0.5), rgba(0,0,0,0.5)),
+                url('/static/images/Sentinel-2_pillars.jpg');
+    background-size: cover;
+    background-attachment: fixed;
+    padding-top: 20px;
+}
+
+.model-container {
+    max-width: 1000px;
+    margin: 40px auto;
+    padding: 30px;
+    background: rgba(33, 37, 41, 0.85);
+    border-radius: 15px;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
 }
 
 .preview-image {
     max-width: 100%;
-    max-height: 300px;
+    max-height: 400px;
+    background: #ffffff;
+    image-rendering: crisp-edges;
     object-fit: contain;
+    border-radius: 8px;
 }
 
-.status-box {
-    background: #f8f9fa;
-    padding: 1rem;
-    border-radius: 0.25rem;
-    margin: 0.75rem 0;
+#imagePreview {
+    display: block;
+    margin: 0 auto;
 }
 
-.progress-container {
-    display: none;
-    margin-top: 1rem;
+#resultContainer {
+    padding: 20px;
+    border-radius: 10px;
+    margin-bottom: 20px;
+    transition: all 0.3s ease;
+}
+
+#resultText {
+    font-weight: 700;
+    transition: color 0.3s ease;
+}
+
+.card {
+    transition: all 0.3s ease;
+    border: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    background: rgba(255, 255, 255, 0.95);
+}
+
+.card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 8px 16px rgba(0,0,0,0.1);
+}
+
+.btn {
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    transition: all 0.3s ease;
+}
+
+.btn-primary {
+    background-color: #3498db;
+    border-color: #3498db;
+}
+
+.btn-primary:hover {
+    background-color: #2980b9;
+    border-color: #2980b9;
+}
+
+.btn-success {
+    background-color: #2ecc71;
+    border-color: #2ecc71;
+}
+
+.btn-success:hover {
+    background-color: #27ae60;
+    border-color: #27ae60;
+}
+
+h1.text-center {
+    color: #ffffff;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+    margin-bottom: 1.5rem;
+    position: relative;
+    padding-bottom: 15px;
+}
+
+h1.text-center:after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 100px;
+    height: 3px;
+    background: linear-gradient(to right, #3498db, #2ecc71);
+    border-radius: 3px;
+}
+
+/* Result image with prediction overlay */
+.result-image-container {
+    position: relative;
+    display: inline-block;
+    margin: 0 auto;
+}
+
+.result-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    background: rgba(0, 0, 0, 0.7);
+    color: white;
+    padding: 5px 10px;
+    font-weight: bold;
+    text-align: center;
+}
+
+.wildfire-overlay {
+    color: #ff4d4d;
+}
+
+.no-wildfire-overlay {
+    color: #4dff4d;
+}
+
+/* Progress bar styles */
+.progress {
+    height: 10px;
+    margin-top: 15px;
+    border-radius: 5px;
+    background-color: rgba(255, 255, 255, 0.2);
 }
 
 .progress-bar {
-    transition: width 0.3s ease;
-    width: 0%;
+    background-color: var(--primary-color);
+    border-radius: 5px;
+}
+
+/* Status messages */
+.status-box {
+    min-height: 60px;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .model-container {
+        padding: 15px;
+    }
+    
+    .navbar {
+        padding: 0.5rem 1rem;
+    }
+    
+    .hamburger {
+        display: block;
+    }
+    
+    .nav-links {
+        display: none;
+    }
 }
